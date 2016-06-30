@@ -6,7 +6,7 @@ public struct DefaultFoo<T> {
 }
 
 public protocol P {
-  typealias Foo
+  associatedtype Foo
 }
 
 public extension P where Foo == DefaultFoo<Self> {
@@ -15,4 +15,10 @@ public extension P where Foo == DefaultFoo<Self> {
   }
 }
 
-// CHECK: define void @_TFe21same_type_constraintsRxS_1Pwx3FoozGVS_10DefaultFoox_rS0_3foofT_GS2_x_
+// CHECK: define{{( protected)?}} void @_TFe21same_type_constraintsRxS_1Pwx3FoozGVS_10DefaultFoox_rS0_3foofT_GS2_x_
+
+// <rdar://26873036> IRGen crash with derived class declaring same-type constraint on constrained associatedtype.
+public class C1<T: Equatable> { }
+public class C2<T: Equatable, U: P where T == U.Foo>: C1<T> {}
+
+// CHECK: define{{( protected)?}} void @_TFC21same_type_constraints2C1D

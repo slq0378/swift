@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See http://swift.org/LICENSE.txt for license information
@@ -14,13 +14,12 @@
 #include "sourcekitd/CodeCompletionResultsArray.h"
 #include "sourcekitd/DocSupportAnnotationArray.h"
 #include "sourcekitd/TokenAnnotationsArray.h"
-#include "sourcekitd/Logging.h"
+#include "sourcekitd/RequestResponsePrinterBase.h"
 #include "SourceKit/Support/UIdent.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include <map>
 #include <vector>
 #include <xpc/xpc.h>
 
@@ -137,56 +136,12 @@ public:
   }
 };
 
-class SKDObjectPrinter : public SKDObjectVisitor<SKDObjectPrinter> {
-  raw_ostream &OS;
-  unsigned Indent;
+class SKDObjectPrinter : public SKDObjectVisitor<SKDObjectPrinter>,
+                         public RequestResponsePrinterBase<SKDObjectPrinter,
+                                                           sourcekitd_object_t> {
 public:
   SKDObjectPrinter(raw_ostream &OS, unsigned Indent = 0)
-    : OS(OS), Indent(Indent) { }
-
-  void visitDictionary(const DictMap &Map) {
-    OS << "{\n";
-    Indent += 2;
-    for (unsigned i = 0, e = Map.size(); i != e; ++i) {
-      auto &Pair = Map[i];
-      OS.indent(Indent);
-      OSColor(OS, DictKeyColor) << Pair.first.getName();
-      OS << ": ";
-      SKDObjectPrinter(OS, Indent).visit(Pair.second);
-      if (i < e-1)
-        OS << ',';
-      OS << '\n';
-    }
-    Indent -= 2;
-    OS.indent(Indent) << '}';
-  }
-
-  void visitArray(ArrayRef<sourcekitd_object_t> Arr) {
-    OS << "[\n";
-    Indent += 2;
-    for (unsigned i = 0, e = Arr.size(); i != e; ++i) {
-      auto Obj = Arr[i];
-      OS.indent(Indent);
-      SKDObjectPrinter(OS, Indent).visit(Obj);
-      if (i < e-1)
-        OS << ',';
-      OS << '\n';
-    }
-    Indent -= 2;
-    OS.indent(Indent) << ']';
-  }
-
-  void visitInt64(int64_t Val) {
-    OS << Val;
-  }
-
-  void visitString(StringRef Str) {
-    OS << '\"' << Str << '\"';
-  }
-
-  void visitUID(StringRef UID) {
-    OSColor(OS, UIDColor) << UID;
-  }
+    : RequestResponsePrinterBase(OS, Indent) { }
 };
 
 } // anonymous namespace.
@@ -200,9 +155,9 @@ void sourcekitd::printRequestObject(sourcekitd_object_t Obj, raw_ostream &OS) {
   SKDObjectPrinter(OS).visit(Obj);
 }
 
-//============================================================================//
+//===----------------------------------------------------------------------===//
 // Internal API
-//============================================================================//
+//===----------------------------------------------------------------------===//
 
 ResponseBuilder::ResponseBuilder() {
   Impl = xpc_dictionary_create(nullptr, nullptr, 0);
@@ -412,35 +367,9 @@ sourcekitd::createErrorRequestCancelled() {
   return CustomXPCData::createErrorRequestCancelled("").getXObj();
 }
 
-//============================================================================//
-// Public API
-//============================================================================//
-
-sourcekitd_uid_t
-sourcekitd_uid_get_from_cstr(const char *string) {
-  return SKDUIDFromUIdent(UIdent(string));
-}
-
-sourcekitd_uid_t
-sourcekitd_uid_get_from_buf(const char *buf, size_t length) {
-  return SKDUIDFromUIdent(UIdent(llvm::StringRef(buf, length)));
-}
-
-size_t
-sourcekitd_uid_get_length(sourcekitd_uid_t uid) {
-  UIdent UID = UIdentFromSKDUID(uid);
-  return UID.getName().size();
-}
-
-const char *
-sourcekitd_uid_get_string_ptr(sourcekitd_uid_t uid) {
-  UIdent UID = UIdentFromSKDUID(uid);
-  return UID.getName().begin();
-}
-
-//============================================================================//
+//===----------------------------------------------------------------------===//
 // Public Request API
-//============================================================================//
+//===----------------------------------------------------------------------===//
 
 static inline const char *strFromUID(sourcekitd_uid_t uid) {
   return UIdentFromSKDUID(uid).c_str();
@@ -554,27 +483,9 @@ sourcekitd_request_uid_create(sourcekitd_uid_t uid) {
   return xpc_uint64_create(uintptr_t(uid));
 }
 
-void
-sourcekitd_request_description_dump(sourcekitd_object_t obj) {
-  // Avoid colors here, we don't properly detect that the debug window inside
-  // Xcode doesn't support colors.
-  llvm::SmallString<128> Desc;
-  llvm::raw_svector_ostream OS(Desc);
-  printRequestObject(obj, OS);
-  llvm::errs() << OS.str() << '\n';
-}
-
-char *
-sourcekitd_request_description_copy(sourcekitd_object_t obj) {
-  llvm::SmallString<128> Desc;
-  llvm::raw_svector_ostream OS(Desc);
-  printRequestObject(obj, OS);
-  return strdup(Desc.c_str());
-}
-
-//============================================================================//
+//===----------------------------------------------------------------------===//
 // Public Response API
-//============================================================================//
+//===----------------------------------------------------------------------===//
 
 void
 sourcekitd_response_dispose(sourcekitd_response_t obj) {
@@ -643,9 +554,9 @@ sourcekitd_response_get_value(sourcekitd_response_t resp) {
   return variantFromXPCObject(resp);
 }
 
-//============================================================================//
+//===----------------------------------------------------------------------===//
 // Variant functions
-//============================================================================//
+//===----------------------------------------------------------------------===//
 
 #define XPC_OBJ(var) ((xpc_object_t)(var).data[1])
 

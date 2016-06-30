@@ -1,20 +1,20 @@
-//===--- Remangle.cpp - Swift re-mangling from a demangling tree ---------===//
+//===--- Remangle.cpp - Swift re-mangling from a demangling tree ----------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See http://swift.org/LICENSE.txt for license information
 // See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
-//===---------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 //
 //  This file implements the remangler, which turns a demangling parse
 //  tree back into a mangled string.  This is useful for tools which
 //  want to extract subtrees from mangled strings.
 //
-//===---------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 #include "swift/Basic/Demangle.h"
 #include "swift/Basic/LLVM.h"
@@ -24,6 +24,7 @@
 #include "swift/Strings.h"
 #include "llvm/ADT/StringRef.h"
 #include <vector>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -70,6 +71,16 @@ static bool isNonAscii(StringRef str) {
   return false;
 }
 
+static char mangleOperatorKind(OperatorKind operatorKind) {
+  switch (operatorKind) {
+  case OperatorKind::NotOperator: unreachable("invalid");
+  case OperatorKind::Infix: return 'i';
+  case OperatorKind::Prefix: return 'p';
+  case OperatorKind::Postfix: return 'P';
+  }
+  unreachable("invalid");
+}
+
 static void mangleIdentifier(StringRef ident, OperatorKind operatorKind,
                              bool usePunycode, DemanglerPrinter &out) {
   std::string punycodeBuf;
@@ -99,15 +110,7 @@ static void mangleIdentifier(StringRef ident, OperatorKind operatorKind,
   //   operator-fixity ::= 'i' // infix
   // where the count is the number of characters in the operator,
   // and where the individual operator characters are translated.
-  out << 'o' << [=] {
-    switch (operatorKind) {
-    case OperatorKind::NotOperator: unreachable("invalid");
-    case OperatorKind::Infix: return 'i';
-    case OperatorKind::Prefix: return 'p';
-    case OperatorKind::Postfix: return 'P';
-    }
-    unreachable("invalid");
-  }();
+  out << 'o' << mangleOperatorKind(operatorKind);
 
   // Mangle ASCII operators directly.
   out << ident.size();
@@ -119,9 +122,10 @@ static void mangleIdentifier(StringRef ident, OperatorKind operatorKind,
 void Demangle::mangleIdentifier(const char *data, size_t length,
                                 OperatorKind operatorKind,
                                 std::string &out, bool usePunycode) {
-  DemanglerPrinter printer(out);
-  return ::mangleIdentifier(StringRef(data, length), operatorKind,
-                            usePunycode, printer);
+  DemanglerPrinter printer;
+  ::mangleIdentifier(StringRef(data, length), operatorKind,
+                     usePunycode, printer);
+  out = std::move(printer).str();
 }
 
 namespace {
@@ -204,14 +208,11 @@ namespace {
   };
 
   class Remangler {
-    struct ArchetypeInfo {
-      Node::IndexType Index;
-      Node::IndexType AbsoluteDepth;
-    };
-
     DemanglerPrinter &Out;
-    std::unordered_map<std::string, ArchetypeInfo> Archetypes;
-    unsigned AbsoluteArchetypeDepth = 0;
+
+    // We have to cons up temporary nodes sometimes when remangling
+    // nested generics. This vector owns them.
+    std::vector<NodePointer> TemporaryNodes;
 
     std::unordered_map<SubstitutionEntry, unsigned,
                        SubstitutionEntry::Hasher> Substitutions;
@@ -219,19 +220,8 @@ namespace {
     Remangler(DemanglerPrinter &out) : Out(out) {}
 
     class EntityContext {
-      Remangler &R;
-      unsigned SavedAbsoluteDepth;
       bool AsContext = false;
     public:
-      EntityContext(Remangler &R)
-        : R(R), SavedAbsoluteDepth(R.AbsoluteArchetypeDepth) {
-      }
-
-      ~EntityContext() {
-        assert(R.AbsoluteArchetypeDepth >= SavedAbsoluteDepth);
-        R.AbsoluteArchetypeDepth = SavedAbsoluteDepth;
-      }
-
       bool isAsContext() const {
         return AsContext;
       }
@@ -258,6 +248,10 @@ namespace {
       }
       unreachable("bad demangling tree node");
     }
+
+    NodePointer getUnspecialized(Node *node);
+    void mangleGenericArgs(Node *node, EntityContext &ctx);
+    void mangleAnyNominalType(Node *node, EntityContext &ctx);
 
 #define NODE(ID)                                                        \
     void mangle##ID(Node *node);
@@ -301,7 +295,6 @@ namespace {
     void mangleEntityContext(Node *node, EntityContext &ctx);
     void mangleEntityType(Node *node, EntityContext &ctx);
     void mangleEntityGenericType(Node *node, EntityContext &ctx);
-    void mangleGenerics(Node *node, EntityContext &ctx);
 
     bool trySubstitution(Node *node, SubstitutionEntry &entry);
     void addSubstitution(const SubstitutionEntry &entry);
@@ -315,7 +308,7 @@ namespace {
 #define NODE(ID)
 #define CONTEXT_NODE(ID)                        \
 void Remangler::mangle##ID(Node *node) {        \
-  EntityContext ctx(*this);                     \
+  EntityContext ctx;                            \
   mangle##ID(node, ctx);                        \
 }
 #include "swift/Basic/DemangleNodes.def"
@@ -450,6 +443,16 @@ void Remangler::mangleGenericSpecialization(Node *node) {
   // Start another mangled name.
   Out << "__T";
 }
+void Remangler::mangleGenericSpecializationNotReAbstracted(Node *node) {
+  Out << "TSr";
+  mangleChildNodes(node); // GenericSpecializationParams
+
+  // Specializations are just prepended to already-mangled names.
+  resetSubstitutions();
+
+  // Start another mangled name.
+  Out << "__T";
+}
 void Remangler::mangleGenericSpecializationParam(Node *node) {
   // Should be a type followed by a series of protocol conformances.
   mangleChildNodes(node);
@@ -469,6 +472,10 @@ void Remangler::mangleFunctionSignatureSpecialization(Node *node) {
 
 void Remangler::mangleSpecializationPassID(Node *node) {
   Out << node->getIndex();
+}
+
+void Remangler::mangleSpecializationIsFragile(Node *node) {
+  Out << "q";
 }
 
 void Remangler::mangleFunctionSignatureSpecializationParam(Node *node) {
@@ -522,8 +529,11 @@ void Remangler::mangleFunctionSignatureSpecializationParam(Node *node) {
     }
     Out << '_';
     return;
-  case FunctionSigSpecializationParamKind::InOutToValue:
+  case FunctionSigSpecializationParamKind::BoxToValue:
     Out << "i_";
+    return;
+  case FunctionSigSpecializationParamKind::BoxToStack:
+    Out << "k_";
     return;
   default:
     if (kindValue &
@@ -695,6 +705,17 @@ void Remangler::mangleProtocolWitnessTable(Node *node) {
   mangleSingleChildNode(node); // protocol conformance
 }
 
+void Remangler::mangleGenericProtocolWitnessTable(Node *node) {
+  Out << "WG";
+  mangleSingleChildNode(node); // protocol conformance
+}
+
+void Remangler::mangleGenericProtocolWitnessTableInstantiationFunction(
+                                                                  Node *node) {
+  Out << "WI";
+  mangleSingleChildNode(node); // protocol conformance
+}
+
 void Remangler::mangleProtocolWitnessTableAccessor(Node *node) {
   Out << "Wa";
   mangleSingleChildNode(node); // protocol conformance
@@ -710,14 +731,17 @@ void Remangler::mangleLazyProtocolWitnessTableCacheVariable(Node *node) {
   mangleChildNodes(node); // type, protocol conformance
 }
 
-void Remangler::mangleDependentProtocolWitnessTableGenerator(Node *node) {
-  Out << "WD";
-  mangleSingleChildNode(node); // protocol conformance
+void Remangler::mangleAssociatedTypeMetadataAccessor(Node *node) {
+  Out << "Wt";
+  mangleChildNodes(node); // protocol conformance, identifier
 }
 
-void Remangler::mangleDependentProtocolWitnessTableTemplate(Node *node) {
-  Out << "Wd";
-  mangleSingleChildNode(node); // protocol conformance
+void Remangler::mangleAssociatedTypeWitnessTableAccessor(Node *node) {
+  Out << "WT";
+  assert(node->getNumChildren() == 3);
+  mangleChildNode(node, 0); // protocol conformance
+  mangleChildNode(node, 1); // identifier
+  mangleProtocolWithoutPrefix(node->begin()[2].get()); // type
 }
 
 void Remangler::mangleReabstractionThunkHelper(Node *node) {
@@ -920,9 +944,6 @@ void Remangler::mangleEntityType(Node *node, EntityContext &ctx) {
 
   // Expand certain kinds of type within the entity context.
   switch (node->getKind()) {
-  case Node::Kind::GenericType:
-    mangleEntityGenericType(node, ctx);
-    return;
   case Node::Kind::FunctionType:
   case Node::Kind::UncurriedFunctionType: {
     Out << (node->getKind() == Node::Kind::FunctionType ? 'F' : 'f');
@@ -1074,9 +1095,12 @@ void Remangler::mangleImplFunctionType(Node *node) {
          i->get()->getKind() == Node::Kind::ImplFunctionAttribute; ++i) {
     mangle(i->get()); // impl function attribute
   }
-  EntityContext ctx(*this);
-  if (i != e && i->get()->getKind() == Node::Kind::Generics) {
-    mangleGenerics((i++)->get(), ctx);
+  if (i != e &&
+      (i->get()->getKind() == Node::Kind::DependentGenericSignature ||
+       i->get()->getKind() == Node::Kind::DependentPseudogenericSignature)) {
+    Out << (i->get()->getKind() == Node::Kind::DependentGenericSignature
+              ? 'G' : 'g');
+    mangleDependentGenericSignature((i++)->get());
   }
   Out << '_';
   for (; i != e && i->get()->getKind() == Node::Kind::ImplParameter; ++i) {
@@ -1130,7 +1154,7 @@ void Remangler::mangleImplConvention(Node *node) {
   } else if (text == "@unowned") {
     Out << 'd';
   } else if (text == "@unowned_inner_pointer") {
-    Out << 'd'; // only in results
+    Out << 'D'; // only in results
   } else if (text == "@guaranteed") {
     Out << 'g';
   } else if (text == "@deallocating") {
@@ -1155,6 +1179,11 @@ void Remangler::mangleDynamicSelf(Node *node) {
 
 void Remangler::mangleErrorType(Node *node) {
   Out << "ERR";
+}
+
+void Remangler::mangleSILBoxType(Node *node) {
+  Out << 'X' << 'b';
+  mangleSingleChildNode(node);
 }
 
 void Remangler::mangleMetatype(Node *node) {
@@ -1254,19 +1283,8 @@ void Remangler::mangleDependentGenericType(Node *node) {
   mangleChildNodes(node); // generic signature, type
 }
 
-void Remangler::mangleGenericType(Node *node) {
-  EntityContext ctx(*this);
-  mangleEntityGenericType(node, ctx);
-}
-
-void Remangler::mangleEntityGenericType(Node *node, EntityContext &ctx) {
-  assert(node->getKind() == Node::Kind::GenericType);
-
-  Out << 'U';
-  assert(node->getNumChildren() == 2);
-
-  mangleGenerics(node->begin()[0].get(), ctx);
-  mangleEntityType(node->begin()[1].get(), ctx);
+void Remangler::mangleDependentPseudogenericSignature(Node *node) {
+  mangleDependentGenericSignature(node);
 }
 
 void Remangler::mangleDependentGenericSignature(Node *node) {
@@ -1335,31 +1353,6 @@ void Remangler::mangleConstrainedType(Node *node) {
     mangleDependentGenericParamIndex(node->getFirstChild().get());
   } else {
     mangle(node);
-  }
-}
-
-void Remangler::mangleGenerics(Node *node) {
-  unreachable("found independent generics node?");
-}
-
-void Remangler::mangleGenerics(Node *node, EntityContext &ctx) {
-  assert(node->getKind() == Node::Kind::Generics);
-
-  unsigned absoluteDepth = ++AbsoluteArchetypeDepth;
-
-  auto i = node->begin(), e = node->end();
-  unsigned index = 0;
-  for (; i != e && i->get()->getKind() == Node::Kind::Archetype; ++i) {
-    auto child = i->get();
-    Archetypes[child->getText()] = ArchetypeInfo{index++, absoluteDepth};
-    mangle(child); // archetype
-  }
-  if (i != e) {
-    Out << 'U';
-    mangleNodes(i, e); // associated types
-    Out << '_';
-  } else {
-    Out << '_';
   }
 }
 
@@ -1528,20 +1521,132 @@ void Remangler::mangleProtocolWithoutPrefix(Node *node) {
   }
 
   assert(node->getKind() == Node::Kind::Protocol);
-  EntityContext ctx(*this);
+  EntityContext ctx;
   mangleNominalType(node, '\0', ctx);
 }
 
+static bool isSpecialized(Node *node) {
+  switch (node->getKind()) {
+  case Node::Kind::BoundGenericStructure:
+  case Node::Kind::BoundGenericEnum:
+  case Node::Kind::BoundGenericClass:
+    return true;
+
+  case Node::Kind::Structure:
+  case Node::Kind::Enum:
+  case Node::Kind::Class: {
+    Node *parentOrModule = node->getChild(0).get();
+    if (isSpecialized(parentOrModule))
+      return true;
+
+    return false;
+  }
+
+  default:
+    return false;
+  }
+}
+
+NodePointer Remangler::getUnspecialized(Node *node) {
+  switch (node->getKind()) {
+  case Node::Kind::Structure:
+  case Node::Kind::Enum:
+  case Node::Kind::Class: {
+    NodePointer result = NodeFactory::create(node->getKind());
+    NodePointer parentOrModule = node->getChild(0);
+    if (isSpecialized(parentOrModule.get()))
+      result->addChild(getUnspecialized(parentOrModule.get()));
+    else
+      result->addChild(parentOrModule);
+    result->addChild(node->getChild(1));
+    return result;
+  }
+
+  case Node::Kind::BoundGenericStructure:
+  case Node::Kind::BoundGenericEnum:
+  case Node::Kind::BoundGenericClass: {
+    NodePointer unboundType = node->getChild(0);
+    assert(unboundType->getKind() == Node::Kind::Type);
+    NodePointer nominalType = unboundType->getChild(0);
+    if (isSpecialized(nominalType.get()))
+      return getUnspecialized(nominalType.get());
+    else
+      return nominalType;
+  }
+
+  default:
+    unreachable("bad nominal type kind");
+  }
+}
+
+void Remangler::mangleGenericArgs(Node *node, EntityContext &ctx) {
+  switch (node->getKind()) {
+  case Node::Kind::Structure:
+  case Node::Kind::Enum:
+  case Node::Kind::Class: {
+    NodePointer parentOrModule = node->getChild(0);
+    mangleGenericArgs(parentOrModule.get(), ctx);
+
+    // No generic arguments at this level
+    Out << '_';
+    break;
+  }
+
+  case Node::Kind::BoundGenericStructure:
+  case Node::Kind::BoundGenericEnum:
+  case Node::Kind::BoundGenericClass: {
+    NodePointer unboundType = node->getChild(0);
+    assert(unboundType->getKind() == Node::Kind::Type);
+    NodePointer nominalType = unboundType->getChild(0);
+    NodePointer parentOrModule = nominalType->getChild(0);
+    mangleGenericArgs(parentOrModule.get(), ctx);
+
+    mangleTypeList(node->getChild(1).get());
+    break;
+  }
+
+  default:
+    break;
+  }
+}
+
+void Remangler::mangleAnyNominalType(Node *node, EntityContext &ctx) {
+  if (isSpecialized(node)) {
+    Out << 'G';
+
+    NodePointer unboundType = getUnspecialized(node);
+    TemporaryNodes.push_back(unboundType);
+
+    mangleAnyNominalType(unboundType.get(), ctx);
+    mangleGenericArgs(node, ctx);
+    return;
+  }
+
+  switch (node->getKind()) {
+  case Node::Kind::Structure:
+    mangleNominalType(node, 'V', ctx);
+    break;
+  case Node::Kind::Enum:
+    mangleNominalType(node, 'O', ctx);
+    break;
+  case Node::Kind::Class:
+    mangleNominalType(node, 'C', ctx);
+    break;
+  default:
+    unreachable("bad nominal type kind");
+  }
+}
+
 void Remangler::mangleStructure(Node *node, EntityContext &ctx) {
-  mangleNominalType(node, 'V', ctx);
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleEnum(Node *node, EntityContext &ctx) {
-  mangleNominalType(node, 'O', ctx);
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleClass(Node *node, EntityContext &ctx) {
-  mangleNominalType(node, 'C', ctx);
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleNominalType(Node *node, char kind, EntityContext &ctx) {
@@ -1552,18 +1657,18 @@ void Remangler::mangleNominalType(Node *node, char kind, EntityContext &ctx) {
 }
 
 void Remangler::mangleBoundGenericClass(Node *node) {
-  Out << 'G';
-  mangleChildNodes(node); // type, type list
+  EntityContext ctx;
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleBoundGenericStructure(Node *node) {
-  Out << 'G';
-  mangleChildNodes(node); // type, type list
+  EntityContext ctx;
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleBoundGenericEnum(Node *node) {
-  Out << 'G';
-  mangleChildNodes(node); // type, type list
+  EntityContext ctx;
+  mangleAnyNominalType(node, ctx);
 }
 
 void Remangler::mangleTypeList(Node *node) {
@@ -1575,8 +1680,7 @@ void Remangler::mangleTypeList(Node *node) {
 std::string Demangle::mangleNode(const NodePointer &node) {
   if (!node) return "";
 
-  std::string str;
-  DemanglerPrinter printer(str);
+  DemanglerPrinter printer;
   Remangler(printer).mangle(node.get());
-  return str;
+  return std::move(printer).str();
 }

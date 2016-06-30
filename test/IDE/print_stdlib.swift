@@ -1,5 +1,8 @@
 // Check interface produced for the standard library.
 //
+// REQUIRES: nonexecutable_test
+//
+// RUN: %target-swift-frontend -parse %s
 // RUN: %target-swift-ide-test -print-module -module-to-print=Swift -source-filename %s -print-interface > %t.txt
 // RUN: FileCheck -check-prefix=CHECK-ARGC %s < %t.txt
 // RUN: FileCheck %s < %t.txt
@@ -13,6 +16,12 @@
 
 // RUN: %target-swift-ide-test -print-module -module-to-print=Swift -source-filename %s -print-interface -skip-underscored-stdlib-protocols > %t-prot.txt
 // RUN: FileCheck -check-prefix=CHECK-UNDERSCORED-PROT %s < %t-prot.txt
+// CHECK-UNDERSCORED-PROT: public protocol _DisallowMixedSignArithmetic
+// CHECK-UNDERSCORED-PROT: public protocol _Incrementable
+// CHECK-UNDERSCORED-PROT: public protocol _Integer
+// CHECK-UNDERSCORED-PROT: public protocol _IntegerArithmetic
+// CHECK-UNDERSCORED-PROT: public protocol _SequenceWrapper
+// CHECK-UNDERSCORED-PROT: public protocol _SignedInteger
 // CHECK-UNDERSCORED-PROT-NOT: protocol _
 
 // CHECK-ARGC: static var argc: CInt { get }
@@ -26,8 +35,9 @@
 // DONT_CHECK-NOT: {{([^I]|$)([^n]|$)([^d]|$)([^e]|$)([^x]|$)([^a]|$)([^b]|$)([^l]|$)([^e]|$)}}
 // CHECK-NOT: buffer: _ArrayBuffer
 // CHECK-NOT: func ~>
-// FIXME: Builtin.
-// FIXME: RawPointer
+// CHECK-NOT: _builtin
+// CHECK-NOT: Builtin.
+// CHECK-NOT: RawPointer
 // CHECK-NOT: extension [
 // CHECK-NOT: extension {{.*}}?
 // CHECK-NOT: extension {{.*}}!
@@ -43,4 +53,26 @@
 
 // CHECK-MUTATING-ATTR: mutating func
 
+func foo(x: _Pointer) {} // Checks that this protocol actually exists.
+// CHECK-NOT: _Pointer
+
 // NO-FIXMES-NOT: FIXME
+// RUN: %target-swift-ide-test -print-module-groups -module-to-print=Swift -source-filename %s -print-interface > %t-group.txt
+// RUN: FileCheck -check-prefix=CHECK-GROUPS1 %s < %t-group.txt
+// CHECK-GROUPS1: Module groups begin:
+// CHECK-GROUPS1-DAG: Pointer
+// CHECK-GROUPS1-DAG: C
+// CHECK-GROUPS1-DAG: Protocols
+// CHECK-GROUPS1-DAG: Optional
+// CHECK-GROUPS1-DAG: Collection/Lazy Views
+// CHECK-GROUPS1-DAG: Math
+// CHECK-GROUPS1-DAG: Reflection
+// CHECK-GROUPS1-DAG: Misc
+// CHECK-GROUPS1-DAG: Collection
+// CHECK-GROUPS1-DAG: Bool
+// CHECK-GROUPS1-DAG: Assert
+// CHECK-GROUPS1-DAG: String
+// CHECK-GROUPS1-DAG: Collection/Array
+// CHECK-GROUPS1-DAG: Collection/Type-erased
+// CHECK-GROUPS1-NOT: <NULL>
+// CHECK-GROUPS1: Module groups end.

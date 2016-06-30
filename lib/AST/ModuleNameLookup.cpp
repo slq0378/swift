@@ -1,8 +1,8 @@
-//===--- ModuleNameLookup.cpp - Name lookup within a module ----*- c++ -*--===//
+//===--- ModuleNameLookup.cpp - Name lookup within a module ---------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See http://swift.org/LICENSE.txt for license information
@@ -108,10 +108,13 @@ static ResolutionKind recordImportDecls(LazyResolver *typeResolver,
     std::copy_if(newDecls.begin(), newDecls.end(), std::back_inserter(results),
                  [&](ValueDecl *result) -> bool {
       if (!result->hasType()) {
-        if (typeResolver)
+        if (typeResolver) {
           typeResolver->resolveDeclSignature(result);
-        else
+          if (result->isInvalid())
+            return true;
+        } else {
           return true;
+        }
       }
       return isValidOverload(overloads, result);
     });
